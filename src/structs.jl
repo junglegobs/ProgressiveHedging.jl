@@ -292,15 +292,11 @@ function VariableInfo(ref::Union{Future,JuMP.VariableRef},
     return VariableInfo(ref, name, nid, 0.0)
 end
 
-mutable struct PHVariable
-    ref::Union{Future,Nothing}
-    value::Float64
+function value(vi::VariableInfo)::Float64
+    return vi.value
 end
 
-PHVariable() = PHVariable(nothing, 0.0)
-
 mutable struct PHHatVariable
-    # scenarios::Set{ScenarioID}
     value::Float64
 end
 
@@ -311,42 +307,77 @@ function value(a::PHHatVariable)
     return a.value
 end
 
+mutable struct RefValuePair
+    ref::Union{Future,Nothing}
+    value::Float64
+end
+
+function RefValuePair()
+    return RefValuePair(nothing, 0.0)
+end
+
+function ref(a::RefValuePair)::Union{Future,Nothing}
+    return a.ref
+end
+
+function value(a::RefValuePair)::Float64
+    return a.value
+end
+
+struct ScenarioVariableRecord
+    p::Float64
+    x::VariableInfo
+    w::RefValuePair
+end
+
+function ScenarioVariableRecord(p::Float64, x::VariableInfo)::ScenarioVariableRecord
+    return ScenarioVariableRecord(p, x, RefValuePair())
+end
+
+struct PHVariableRecord
+    scen_bundle::Dict{ScenarioID,ScenarioVariableRecord}
+    xhat::PHHatVariable
+end
+
+function PHVariableRecord()::PHVariableRecord
+    return PHVariableRecord(Dict{ScenarioID,ScenarioVariableRecord}(), PHHatVariable())
+end
+
+function add_scenario_record(phvr::PHVariableRecord,
+                             s::ScenarioID,
+                             srec::ScenarioVariableRecord)
+    phvr.scen_bundle[s] = srec
+    return
+end
+
+function is_leaf_record(phvr::PHVariableRecord)
+    return length(phvr.scen_bundle) == 1
+end
+
+function xhat_value(phvr::PHVariableRecord)::Float64
+    return value(phvr.xhat)
+end
+
+function set_xhat_value(phvr::PHVariableRecord, value::Float64)::Nothing
+    phvr.xhat.value = value
+    return
+end
+
 struct ScenarioInfo
     proc::Int
     prob::Float64
     model::Future
-    branch_map::Dict{VariableID, VariableInfo}
-    leaf_map::Dict{VariableID, VariableInfo}
-    W::Dict{VariableID, PHVariable}
-    Xhat::Dict{XhatID, PHVariable}
-end
-
-function ScenarioInfo(proc::Int, prob::Float64, submodel::Future,
-                      branch_map::Dict{VariableID, VariableInfo},
-                      leaf_map::Dict{VariableID, VariableInfo})
-
-    w_dict = Dict{VariableID, PHVariable}(vid => PHVariable()
-                                          for vid in keys(branch_map))
-
-    x_dict = Dict{XhatID, PHVariable}()
-    for (vid,vinfo) in pairs(branch_map)
-        x_dict[XhatID(vinfo.node_id, vid.index)] = PHVariable()
-    end
-
-    return ScenarioInfo(proc,
-                        prob,
-                        submodel,
-                        branch_map,
-                        leaf_map,
-                        w_dict,
-                        x_dict)
+    branch_vars::Dict{VariableID, VariableInfo}
+    leaf_vars::Dict{VariableID, VariableInfo}
+    w_vars::Dict{VariableID, RefValuePair}
+    xhat_vars::Dict{XhatID, RefValuePair}
 end
 
 function retrieve_variable(sinfo::ScenarioInfo, vid::VariableID)::VariableInfo
-    if haskey(sinfo.branch_map, vid)
-        vi = sinfo.branch_map[vid]
+    if haskey(sinfo.branch_vars, vid)
+        vi = sinfo.branch_vars[vid]
     else
-        vi = sinfo.leaf_map[vid]
+        vi = sinfo.leaf_vars[vid]
     end
     return vi
 end
@@ -377,8 +408,8 @@ end
 struct PHData
     r::Float64
     scenario_tree::ScenarioTree
-    scenario_map::Dict{ScenarioID, ScenarioInfo}
-    Xhat::Dict{XhatID, PHHatVariable}
+    scenario_view::Dict{ScenarioID, ScenarioInfo}
+    ph_view::Dict{XhatID, PHVariableRecord}
     time_info::TimerOutputs.TimerOutput
     residual_info::PHResidualHistory
 end
@@ -391,40 +422,53 @@ function PHData(r::N, tree::ScenarioTree,
                 time_out::TimerOutputs.TimerOutput
                 ) where {N <: Number}
 
-    xhat_dict = Dict{XhatID, PHHatVariable}()
-
-    scenario_map = Dict{ScenarioID, ScenarioInfo}()
+    scenario_view = Dict{ScenarioID, ScenarioInfo}()
+    ph_view = Dict{XhatID, PHVariableRecord}()
     for (scid, model) in pairs(submodels)
 
-        leaf_map = Dict{VariableID, VariableInfo}()
-        branch_map = Dict{VariableID, VariableInfo}()
+        leaf_vars = Dict{VariableID, VariableInfo}()
+        branch_vars = Dict{VariableID, VariableInfo}()
+        w_vars = Dict{VariableID, RefValuePair}()
+        xhat_vars = Dict{XhatID, RefValuePair}()
+
+        p = probs[scid]
+
         for (vid, vinfo) in var_map[scid]
 
-            if is_leaf(tree, vinfo.node_id)
-                leaf_map[vid] = vinfo
-            else
-                branch_map[vid] = vinfo
+            xid = XhatID(vinfo.node_id, vid.index)
+
+            if !haskey(ph_view, xid)
+                ph_view[xid] = PHVariableRecord()
             end
 
-            xid = XhatID(vinfo.node_id, vid.index)
-            if !haskey(xhat_dict, xid)
-                xhat_dict[xid] = PHHatVariable()
+            sv_rec = ScenarioVariableRecord(p, vinfo)
+            add_scenario_record(ph_view[xid], scid, sv_rec)
+
+            if is_leaf(tree, vinfo.node_id)
+                leaf_vars[vid] = vinfo
+            else
+                branch_vars[vid] = vinfo
+                w_vars[vid] = sv_rec.w
+                xhat_vars[xid] = RefValuePair()
             end
+
         end
 
-        scenario_map[scid] = ScenarioInfo(scen_proc_map[scid],
-                                          probs[scid],
-                                          model,
-                                          branch_map,
-                                          leaf_map,
-                                          )
+        scenario_view[scid] = ScenarioInfo(scen_proc_map[scid],
+                                           p,
+                                           model,
+                                           branch_vars,
+                                           leaf_vars,
+                                           w_vars,
+                                           xhat_vars
+                                           )
 
     end
 
     return PHData(float(r),
                   tree,
-                  scenario_map,
-                  xhat_dict,
+                  scenario_view,
+                  ph_view,
                   time_out,
                   PHResidualHistory(),
                   )
@@ -439,12 +483,22 @@ function save_residual(phd::PHData, iter::Int, res::Float64)::Nothing
     return
 end
 
+function scenario_bundle(phd::PHData, xid::XhatID)::Set{ScenarioID}
+    return scenario_bundle(phd.scenario_tree, xid.node)
+end
+
 function stage_id(phd::PHData, xid::XhatID)::StageID
     return phd.scenario_tree.tree_map[xid.node].stage
 end
 
-function scenario_bundle(phd::PHData, xid::XhatID)::Set{ScenarioID}
-    return scenario_bundle(phd.scenario_tree, xid.node)
+function num_shared_variables(phd::PHData)::Int
+    count = 0
+    for (xhid, phv_rec) in pairs(phd.ph_view)
+        if !is_leaf_record(phv_rec)
+            count += 1
+        end
+    end
+    return count
 end
 
 function convert_to_variable_id(phd::PHData, xid::XhatID)
@@ -455,6 +509,6 @@ function convert_to_variable_id(phd::PHData, xid::XhatID)
 end
 
 function convert_to_xhat_id(phd::PHData, scid::ScenarioID, vid::VariableID)::XhatID
-    vinfo = retrieve_variable(phd.scenario_map[scid], vid)
+    vinfo = retrieve_variable(phd.scenario_view[scid], vid)
     return XhatID(vinfo.node_id, vid.index)
 end

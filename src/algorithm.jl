@@ -10,16 +10,16 @@ end
 
 function retrieve_values(phd::PHData, leaf_mode::Bool)::Nothing
 
-    map_sym = leaf_mode ? :leaf_map : :branch_map
+    map_sym = leaf_mode ? :leaf_vars : :branch_vars
 
     val_dict = Dict{ScenarioID, Future}()
-    for (scid,sinfo) in phd.scenario_map
+    for (scid,sinfo) in phd.scenario_view
         vmap = getfield(sinfo, map_sym)
         val_dict[scid] = @spawnat(sinfo.proc, _report_values(vmap))
     end
 
     for (scid,fv) in pairs(val_dict)
-        sinfo = phd.scenario_map[scid]
+        sinfo = phd.scenario_view[scid]
         var_values = fetch(fv)
         for (vid, value) in pairs(var_values)
             vmap = getfield(sinfo, map_sym)
@@ -32,77 +32,58 @@ end
 
 function compute_and_save_xhat(phd::PHData)::Float64
 
-    xhat_res = 0.0
+    xhat_res_sq = 0.0
 
-    for (node_id, node) in pairs(phd.scenario_tree.tree_map)
-
-        if is_leaf(node)
+    for (xhid, phv_rec) in pairs(phd.ph_view)
+        if length(phv_rec.scen_bundle) == 1
             continue
         end
 
-        for i in node.variable_indices
+        xhat = 0.0
+        norm = 0.0
 
-            xhat = 0.0
-            norm = 0.0
-            
-            for s in node.scenario_bundle
-                
-                p = phd.scenario_map[s].prob
-                x = branch_value(phd, s, node.stage, i)
-
-                xhat += p * x
-                norm += p
-                
-            end
-
-            xhat_id = XhatID(node_id,i)
-            xhat_new = xhat / norm
-
-            xhat_old = phd.Xhat[xhat_id].value
-            phd.Xhat[xhat_id].value = xhat_new
-
-            xhat_res += (xhat_new - xhat_old)^2
+        for (s, sv_rec) in pairs(phv_rec.scen_bundle)
+            xhat += sv_rec.p * value(sv_rec.x)
+            norm += sv_rec.p
         end
+
+        xhat_new = xhat / norm
+        xhat_res_sq += (xhat_new - xhat_value(phv_rec))^2
+        set_xhat_value(phv_rec, xhat_new)
+
     end
 
-    return xhat_res
+    return xhat_res_sq
 end
 
 function compute_and_save_w(phd::PHData)::Float64
 
     kxsq = 0.0
 
-    for (node_id, node) in pairs(phd.scenario_tree.tree_map)
-
-        if is_leaf(node)
+    for (xhid, phv_rec) in pairs(phd.ph_view)
+        if length(phv_rec.scen_bundle) == 1
             continue
         end
 
-        for i in node.variable_indices
+        xhat = value(phv_rec.xhat)
 
-            xhat = phd.Xhat[XhatID(node_id,i)].value
-            
-            exp = 0.0
-            norm = 0.0
+        exp = 0.0
+        norm = 0.0
 
-            for s in node.scenario_bundle
-                p = phd.scenario_map[s].prob
+        for (s,sv_rec) in pairs(phv_rec.scen_bundle)
+            kx = value(sv_rec.x) - xhat
+            sv_rec.w.value += phd.r * kx
 
-                var_id = VariableID(node.stage, i)
-                kx = branch_value(phd, s, var_id) - xhat
-                phd.scenario_map[s].W[var_id].value += phd.r * kx
+            kxsq += sv_rec.p * kx^2
 
-                kxsq += p * kx^2
+            exp += sv_rec.p * sv_rec.w.value
+            norm += sv_rec.p
+        end
 
-                exp += p * w_value(phd, s, var_id)
-                norm += p
-            end
-
-            if abs(exp) > 1e-6
-                @warn("Conditional expectation of " *
-                      "W[$(node.scenario_bundle),$(node.stage),$i] " *
-                      "is non-zero: " * string(exp/norm))
-            end
+        if abs(exp) > 1e-6
+            @warn("Conditional expectation of " *
+                  "W[$(node.scenario_bundle),$(node.stage),$i] " *
+                  "is non-zero: " * string(exp/norm))
         end
     end
 
@@ -119,11 +100,12 @@ end
 function update_ph_leaf_variables(phd::PHData)::Nothing
     retrieve_values(phd, true)
 
-    for (xid, xhat) in pairs(phd.Xhat)
+    for (xid, phv_rec) in pairs(phd.ph_view)
         if is_leaf(phd.scenario_tree, xid.node)
             @assert(length(scenario_bundle(phd, xid)) == 1)
             (scid, vid) = convert_to_variable_id(phd, xid)
-            xhat.value = phd.scenario_map[scid].leaf_map[vid].value
+            set_xhat_value(phv_rec,
+                           phd.scenario_view[scid].leaf_vars[vid].value)
         end
     end
 
@@ -142,7 +124,7 @@ end
 
 function set_start_values(phd::PHData)::Nothing
 
-    @sync for (scid, sinfo) in pairs(phd.scenario_map)
+    @sync for (scid, sinfo) in pairs(phd.scenario_view)
         model = sinfo.model
         @spawnat(sinfo.proc, _set_start_values(fetch(model)))
     end
@@ -151,7 +133,7 @@ function set_start_values(phd::PHData)::Nothing
 
 end
 
-function _fix_values(ph_vars::Vector{PHVariable})::Nothing
+function _fix_values(ph_vars::Vector{RefValuePair})::Nothing
 
     for phv in ph_vars
         JuMP.fix(fetch(phv.ref), phv.value, force=true)
@@ -161,9 +143,9 @@ function _fix_values(ph_vars::Vector{PHVariable})::Nothing
 end
 
 function update_si_xhat(phd::PHData)::Nothing
-    for (scid, sinfo) in pairs(phd.scenario_map)
-        for (xhat_id, x_var) in pairs(sinfo.Xhat)
-            x_var.value = phd.Xhat[xhat_id].value
+    for (scid, sinfo) in pairs(phd.scenario_view)
+        for (xhat_id, xhat_var) in pairs(sinfo.xhat_vars)
+            xhat_var.value = value(phd.ph_view[xhat_id].xhat)
         end
     end
     return
@@ -173,9 +155,9 @@ function fix_ph_variables(phd::PHData)::Nothing
 
     update_si_xhat(phd)
 
-    @sync for (scid, sinfo) in pairs(phd.scenario_map)
-        w_array = collect(values(sinfo.W))
-        xhat_array = collect(values(sinfo.Xhat))
+    @sync for (scid, sinfo) in pairs(phd.scenario_view)
+        w_array = collect(values(sinfo.w_vars))
+        xhat_array = collect(values(sinfo.xhat_vars))
 
         @spawnat(sinfo.proc, _fix_values(w_array))
         @spawnat(sinfo.proc, _fix_values(xhat_array))
@@ -188,12 +170,12 @@ function solve_subproblems(phd::PHData)::Nothing
 
     # Find subproblem solutions--in parallel if we have the workers for it.
     # @sync will wait for all processes to complete
-    @sync for (scen, sinfo) in pairs(phd.scenario_map)
+    @sync for (scen, sinfo) in pairs(phd.scenario_view)
         model = sinfo.model
         @spawnat(sinfo.proc, JuMP.optimize!(fetch(model)))
     end
 
-    for (scen, sinfo) in pairs(phd.scenario_map)
+    for (scen, sinfo) in pairs(phd.scenario_view)
         # MOI refers to the MathOptInterface package. Apparently this is made
         # accessible by JuMP since it is not imported here
         model = sinfo.model
@@ -221,8 +203,8 @@ function hedge(ph_data::PHData,
     (xhat_res_sq, x_res_sq) = @timeit(ph_data.time_info, "Update PH Vars",
                                       update_ph_variables(ph_data))
 
-    nsqrt = sqrt(length(ph_data.Xhat))
-    xmax = max(maximum(abs.(value.(values(ph_data.Xhat)))), 1e-12)
+    nsqrt = sqrt(num_shared_variables(ph_data))
+    xmax = max(maximum(abs.(xhat_value.(values(ph_data.ph_view)))), 1e-12)
     residual = sqrt(xhat_res_sq + x_res_sq) / nsqrt
 
     if report_flag
@@ -263,7 +245,7 @@ function hedge(ph_data::PHData,
         # its corresponding xhat variable (so lack of consensus amongst the
         # subproblems or violation of the nonanticipativity constraint)
         residual= sqrt(xhat_res_sq + x_res_sq) / nsqrt
-        xmax = max(maximum(abs.(value.(values(ph_data.Xhat)))), 1e-12)
+        xmax = max(maximum(abs.(xhat_value.(values(ph_data.ph_view)))), 1e-12)
         
         niter += 1
 

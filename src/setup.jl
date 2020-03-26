@@ -88,10 +88,10 @@ function order_augment(phd::PHData)::Dict{ScenarioID,Future}
     ref_map = Dict{ScenarioID, Future}()
 
     # Create variables and augment objectives
-    @sync for (scid, sinfo) in pairs(phd.scenario_map)
+    @sync for (scid, sinfo) in pairs(phd.scenario_view)
         r = phd.r
         model = sinfo.model
-        var_map = sinfo.branch_map
+        var_map = sinfo.branch_vars
 
         ref_map[scid] = @spawnat(sinfo.proc,
                                  _augment_objective(fetch(model),
@@ -113,18 +113,24 @@ function retrieve_ph_refs(phd::PHData,
         
         for scid in node.scenario_bundle
 
-            sinfo = phd.scenario_map[scid]
+            sinfo = phd.scenario_view[scid]
             vrefs = ref_map[scid]
 
             for i in node.variable_indices
 
                 vid = VariableID(node.stage, i)
-                sinfo.W[vid].ref = @spawnat(sinfo.proc,
-                                            get(fetch(vrefs)[1], vid, nothing))
+                xhid = XhatID(node.id, i)
 
-                xid = XhatID(nid, i)
-                sinfo.Xhat[xid].ref = @spawnat(sinfo.proc,
-                                               get(fetch(vrefs)[2], vid, nothing))
+                sinfo.w_vars[vid].ref = @spawnat(sinfo.proc,
+                                                 get(fetch(vrefs)[1],
+                                                     vid,
+                                                     nothing)
+                                                 )
+                sinfo.xhat_vars[xhid].ref = @spawnat(sinfo.proc,
+                                                     get(fetch(vrefs)[2],
+                                                         vid,
+                                                         nothing)
+                                                     )
 
             end
         end
@@ -164,7 +170,6 @@ function _create_model(sint::Int,
 
     return model
 end
-    
 
 function create_models(scen_tree::ScenarioTree,
                        model_constructor::Function,
