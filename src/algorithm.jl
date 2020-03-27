@@ -30,15 +30,17 @@ function retrieve_values(phd::PHData, leaf_mode::Bool)::Nothing
     return
 end
 
-function compute_and_save_xhat(phd::PHData)::Float64
+function compute_and_save(phd::PHData)::Tuple{Float64,Float64}
 
-    res_sq = zeros(Threads.nthreads())
+    x_res_sq = zeros(Threads.nthreads())
+    w_res_sq = zeros(Threads.nthreads())
 
-    Threads.@threads for xhid in collect(keys((phd.ph_view)))
+    Threads.@threads for xhid in collect(keys(phd.ph_view))
 
         phv_rec = phd.ph_view[xhid]
         @assert(length(phv_rec.scen_bundle) > 1)
 
+        # Update xhat
         xhat = 0.0
         norm = 0.0
 
@@ -47,37 +49,20 @@ function compute_and_save_xhat(phd::PHData)::Float64
             norm += sv_rec.p
         end
 
-        xhat_new = xhat / norm
-        res_sq[Threads.threadid()] += (xhat_new - xhat_value(phv_rec))^2
-        set_xhat_value(phv_rec, xhat_new)
+        xhat = xhat / norm
+        x_res_sq[Threads.threadid()] += (xhat - xhat_value(phv_rec))^2
+        set_xhat_value(phv_rec, xhat)
 
-    end
-
-    return sum(res_sq)
-end
-
-function compute_and_save_w(phd::PHData)::Float64
-
-    res_sq = zeros(Threads.nthreads())
-
-    Threads.@threads for xhid in collect(keys((phd.ph_view)))
-
-        phv_rec = phd.ph_view[xhid]
-        @assert(length(phv_rec.scen_bundle) > 1)
-
-        xhat = value(phv_rec.xhat)
-
+        # Update w
         exp = 0.0
-        norm = 0.0
 
         for (s,sv_rec) in pairs(phv_rec.scen_bundle)
             kx = value(sv_rec.x) - xhat
             sv_rec.w.value += phd.r * kx
 
-            res_sq[Threads.threadid()] += sv_rec.p * kx^2
+            w_res_sq[Threads.threadid()] += sv_rec.p * kx^2
 
             exp += sv_rec.p * sv_rec.w.value
-            norm += sv_rec.p
         end
 
         if abs(exp) > 1e-6
@@ -85,16 +70,15 @@ function compute_and_save_w(phd::PHData)::Float64
                   "W[$(node.scenario_bundle),$(node.stage),$i] " *
                   "is non-zero: " * string(exp/norm))
         end
+
     end
 
-    return sum(res_sq)
+    return (sum(x_res_sq), sum(w_res_sq))
 end
 
 function update_ph_variables(phd::PHData)::Tuple{Float64,Float64}
     retrieve_values(phd, false)
-    xhat_residual = compute_and_save_xhat(phd)
-    x_residual = compute_and_save_w(phd)
-    return (xhat_residual, x_residual)
+    return compute_and_save(phd)
 end
 
 function update_ph_leaf_variables(phd::PHData)::Nothing
