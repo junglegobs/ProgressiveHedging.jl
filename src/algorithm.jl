@@ -32,12 +32,12 @@ end
 
 function compute_and_save_xhat(phd::PHData)::Float64
 
-    xhat_res_sq = 0.0
+    res_sq = zeros(Threads.nthreads())
 
-    for (xhid, phv_rec) in pairs(phd.ph_view)
-        if length(phv_rec.scen_bundle) == 1
-            continue
-        end
+    Threads.@threads for xhid in collect(keys((phd.ph_view)))
+
+        phv_rec = phd.ph_view[xhid]
+        @assert(length(phv_rec.scen_bundle) > 1)
 
         xhat = 0.0
         norm = 0.0
@@ -48,22 +48,22 @@ function compute_and_save_xhat(phd::PHData)::Float64
         end
 
         xhat_new = xhat / norm
-        xhat_res_sq += (xhat_new - xhat_value(phv_rec))^2
+        res_sq[Threads.threadid()] += (xhat_new - xhat_value(phv_rec))^2
         set_xhat_value(phv_rec, xhat_new)
 
     end
 
-    return xhat_res_sq
+    return sum(res_sq)
 end
 
 function compute_and_save_w(phd::PHData)::Float64
 
-    kxsq = 0.0
+    res_sq = zeros(Threads.nthreads())
 
-    for (xhid, phv_rec) in pairs(phd.ph_view)
-        if length(phv_rec.scen_bundle) == 1
-            continue
-        end
+    Threads.@threads for xhid in collect(keys((phd.ph_view)))
+
+        phv_rec = phd.ph_view[xhid]
+        @assert(length(phv_rec.scen_bundle) > 1)
 
         xhat = value(phv_rec.xhat)
 
@@ -74,7 +74,7 @@ function compute_and_save_w(phd::PHData)::Float64
             kx = value(sv_rec.x) - xhat
             sv_rec.w.value += phd.r * kx
 
-            kxsq += sv_rec.p * kx^2
+            res_sq[Threads.threadid()] += sv_rec.p * kx^2
 
             exp += sv_rec.p * sv_rec.w.value
             norm += sv_rec.p
@@ -87,7 +87,7 @@ function compute_and_save_w(phd::PHData)::Float64
         end
     end
 
-    return kxsq
+    return sum(res_sq)
 end
 
 function update_ph_variables(phd::PHData)::Tuple{Float64,Float64}
@@ -98,14 +98,17 @@ function update_ph_variables(phd::PHData)::Tuple{Float64,Float64}
 end
 
 function update_ph_leaf_variables(phd::PHData)::Nothing
+
     retrieve_values(phd, true)
 
-    for (xid, phv_rec) in pairs(phd.ph_view)
-        if is_leaf(phd.scenario_tree, xid.node)
-            @assert(length(scenario_bundle(phd, xid)) == 1)
-            (scid, vid) = convert_to_variable_id(phd, xid)
-            set_xhat_value(phv_rec,
-                           phd.scenario_view[scid].leaf_vars[vid].value)
+    for (scid, sinfo) in pairs(phd.scenario_view)
+        for (vid, vinfo) in pairs(sinfo.leaf_vars)
+            xhid = convert_to_xhat_id(phd, scid, vid)
+            @assert(!haskey(phd.ph_view, xhid))
+
+            phvr = PHVariableRecord()
+            set_xhat_value(phvr, vinfo.value)
+            phd.ph_view[xhid] = phvr
         end
     end
 
@@ -203,7 +206,7 @@ function hedge(ph_data::PHData,
     (xhat_res_sq, x_res_sq) = @timeit(ph_data.time_info, "Update PH Vars",
                                       update_ph_variables(ph_data))
 
-    nsqrt = sqrt(num_shared_variables(ph_data))
+    nsqrt = sqrt(length(ph_data.ph_view))
     xmax = max(maximum(abs.(xhat_value.(values(ph_data.ph_view)))), 1e-12)
     residual = sqrt(xhat_res_sq + x_res_sq) / nsqrt
 

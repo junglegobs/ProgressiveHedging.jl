@@ -437,17 +437,18 @@ function PHData(r::N, tree::ScenarioTree,
 
             xid = XhatID(vinfo.node_id, vid.index)
 
-            if !haskey(ph_view, xid)
-                ph_view[xid] = PHVariableRecord()
-            end
-
-            sv_rec = ScenarioVariableRecord(p, vinfo)
-            add_scenario_record(ph_view[xid], scid, sv_rec)
-
             if is_leaf(tree, vinfo.node_id)
                 leaf_vars[vid] = vinfo
             else
                 branch_vars[vid] = vinfo
+
+                if !haskey(ph_view, xid)
+                    ph_view[xid] = PHVariableRecord()
+                end
+
+                sv_rec = ScenarioVariableRecord(p, vinfo)
+                add_scenario_record(ph_view[xid], scid, sv_rec)
+
                 w_vars[vid] = sv_rec.w
                 xhat_vars[xid] = RefValuePair()
             end
