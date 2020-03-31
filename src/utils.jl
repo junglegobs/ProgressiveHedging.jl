@@ -20,7 +20,7 @@ end
 branch_value(phd::PHData, scen::ScenarioID, stage::StageID, idx::Index)::Float64 = branch_value(phd, scen, VariableID(stage, idx))
 
 function leaf_value(phd::PHData, scen::ScenarioID, vid::VariableID)::Float64
-    return phd.scenario_view[scen].leaf_map[vid].value
+    return phd.scenario_view[scen].leaf_vars[vid].value
 end
 
 leaf_value(phd::PHData, scen::ScenarioID, stage::StageID, idx::Index)::Float64 = leaf_value(phd, scen, VariableID(stage, idx))
@@ -130,9 +130,9 @@ function retrieve_obj_value(phd::PHData)::Float64
 end
 
 function two_stage_tree(n::Int;
-                        pdict::Union{Nothing,Dict{Int,R}}=nothing
+                        pvect::Union{Nothing,Vector{R}}=nothing
                         )::ScenarioTree where R <: Real
-    p = pdict == nothing ? Dict([k => 1.0/n for k in 1:n]) : pdict
+    p = pvect == nothing ? [1.0/n for k in 1:n] : pvect
 
     st = ScenarioTree()
     for k in 1:n
